@@ -173,6 +173,8 @@ def run_training(args):
     test_actor = ResNetTestActor.remote()
 
     step = 0
+    for param in model.parameters():
+        print(param)
     weight_id = ray.put(model.parameters()['weight'])
     acc_id = test_actor.validate.remote(weight_id, step)
 
