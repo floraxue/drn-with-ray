@@ -1,6 +1,7 @@
 import argparse
 import shutil
 import time
+import copy
 
 import numpy as np
 import os
@@ -15,6 +16,8 @@ import torch.optim
 import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
+
+import ray
 
 import drn as models
 
@@ -62,6 +65,15 @@ def parse_args():
     parser.add_argument('--crop-size', dest='crop_size', type=int, default=224)
     parser.add_argument('--scale-size', dest='scale_size', type=int, default=256)
     parser.add_argument('--step-ratio', dest='step_ratio', type=float, default=0.1)
+
+    # ray params
+    parser.add_argument("--eval_batch_count", default=50, type=int,
+                        help="Number of batches to evaluate over.")
+    parser.add_argument("--num_gpus", default=0, type=int,
+                        help="Number of GPUs to use for training.")
+    parser.add_argument("--redis-address", default=None, type=str,
+                        help="The Redis address of the cluster.")
+
     args = parser.parse_args()
     return args
 
@@ -76,7 +88,43 @@ def main():
         test_model(args)
 
 
+@ray.remote
+def get_train_data(traindir, normalize, batch_size, workers):
+    train_loader = torch.utils.data.DataLoader(
+        datasets.ImageFolder(traindir, transforms.Compose([
+            transforms.RandomSizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize,
+        ])),
+        batch_size=batch_size, shuffle=True,
+        num_workers=workers, pin_memory=True)
+    return train_loader
+
+
+@ray.remote
+def get_val_data(valdir, normalize, batch_size, workers):
+    val_loader = torch.utils.data.DataLoader(
+        datasets.ImageFolder(valdir, transforms.Compose([
+            transforms.Scale(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize,
+        ])),
+        batch_size=batch_size, shuffle=False,
+        num_workers=workers, pin_memory=True)
+    return val_loader
+
+
 def run_training(args):
+
+    # ray
+    num_gpus = args.num_gpus
+    if args.redis_address is None:
+        ray.init(num_gpus=num_gpus, redirect_output=True)
+    else:
+        ray.init(redis_address=args.redis_address)
+
     # create model
     model = models.__dict__[args.arch](args.pretrained)
 
@@ -105,25 +153,9 @@ def run_training(args):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-    train_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(traindir, transforms.Compose([
-            transforms.RandomSizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True)
-
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Scale(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
+    train_loader = get_train_data.remote(traindir, normalize, args.batch_size,
+                                         args.workers)
+    val_loader = get_val_data.remote(valdir, normalize, args.batch_size, args.workers)
 
     # define loss function (criterion) and pptimizer
     criterion = nn.CrossEntropyLoss().cuda()
@@ -132,16 +164,49 @@ def run_training(args):
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
+    # ray
+    if args.num_gpus > 0:
+        train_actors = [ResNetTrainActor.remote()
+                        for _ in range(num_gpus)]
+    else:
+        train_actors = [ResNetTrainActor.remote()]
+    test_actor = ResNetTestActor.remote()
+
+    step = 0
+    weight_id = train_actors[0].get_weights.remote()
+    acc_id = test_actor.accuracy.remote(weight_id, step)
+
+    if num_gpus == 0:
+        num_gpus = 1
+    print("Starting training loop.")
+
     for epoch in range(args.start_epoch, args.epochs):
         adjust_learning_rate(args, optimizer, epoch)
 
         # train for one epoch
-        train(args, train_loader, model, criterion, optimizer, epoch)
+        # train(args, train_loader, model, criterion, optimizer, epoch)
+        # ray train
+        # TODO how to get weights from the DRN model? model.parameters?
+        all_weights = ray.get([actor.train.remote(args, train_loader, model,
+                                                  weight_id, criterion,
+                                                  optimizer, epoch)
+                               for actor in train_actors])
+        mean_weights = {k: (sum([weights[k] for weights in all_weights]) /
+                            num_gpus)
+                        for k in all_weights[0]}
+        weight_id = ray.put(mean_weights)
+        step += 1
 
         # evaluate on validation set
-        prec1 = validate(args, val_loader, model, criterion)
+        # prec1 = validate(args, val_loader, model, criterion)
+        # ray validate
+        acc = ray.get(acc_id)
+        acc_id = test_actor.validate.remote(args, val_loader, model, weight_id,
+                                            criterion)
+        print("Step {0}: {1:.6f}".format(step - 200, acc))
 
         # remember best prec@1 and save checkpoint
+        prec1 = acc
         is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
 
@@ -197,53 +262,117 @@ def test_model(args):
     validate(args, val_loader, model, criterion)
 
 
-def train(args, train_loader, model, criterion, optimizer, epoch):
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
-    top5 = AverageMeter()
+@ray.remote
+class ResNetTrainActor():
+    def __init__(self):
+        pass
 
-    # switch to train mode
-    model.train()
+    def train(self, args, train_loader, model, weight_id, criterion, optimizer,
+              epoch):
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
+        losses = AverageMeter()
+        top1 = AverageMeter()
+        top5 = AverageMeter()
 
-    end = time.time()
-    for i, (input, target) in enumerate(train_loader):
-        # measure data loading time
-        data_time.update(time.time() - end)
+        # switch to train mode
+        model.train()
 
-        target = target.cuda(async=True)
-        input_var = torch.autograd.Variable(input)
-        target_var = torch.autograd.Variable(target)
+        # ray
+        model.parameters()['weight'] = ray.get(weight_id)
 
-        # compute output
-        output = model(input_var)
-        loss = criterion(output, target_var)
-
-        # measure accuracy and record loss
-        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0))
-        top5.update(prec5[0], input.size(0))
-
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
         end = time.time()
+        for i, (input, target) in enumerate(train_loader):
+            # measure data loading time
+            data_time.update(time.time() - end)
 
-        if i % args.print_freq == 0:
-            print('Epoch: [{0}][{1}/{2}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                   epoch, i, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=losses, top1=top1, top5=top5))
+            target = target.cuda(async=True)
+            input_var = torch.autograd.Variable(input)
+            target_var = torch.autograd.Variable(target)
+
+            # compute output
+            output = model(input_var)
+            loss = criterion(output, target_var)
+
+            # measure accuracy and record loss
+            prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+            losses.update(loss.data[0], input.size(0))
+            top1.update(prec1[0], input.size(0))
+            top5.update(prec5[0], input.size(0))
+
+            # compute gradient and do SGD step
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                print('Epoch: [{0}][{1}/{2}]\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                      'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                       epoch, i, len(train_loader), batch_time=batch_time,
+                       data_time=data_time, loss=losses, top1=top1, top5=top5))
+        for param in model.parameters():
+            print(param.data)
+        return copy.deepcopy(model.parameters()['weight'])
+
+
+@ray.remote
+class ResNetTestActor():
+    def __init__(self):
+        pass
+
+    def validate(self, args, val_loader, model, weight_id, criterion):
+        batch_time = AverageMeter()
+        losses = AverageMeter()
+        top1 = AverageMeter()
+        top5 = AverageMeter()
+
+        # switch to evaluate mode
+        model.eval()
+
+        # ray
+        model.parameters()['weight'] = ray.get(weight_id)
+
+        end = time.time()
+        for i, (input, target) in enumerate(val_loader):
+            target = target.cuda(async=True)
+            input_var = torch.autograd.Variable(input, volatile=True)
+            target_var = torch.autograd.Variable(target, volatile=True)
+
+            # compute output
+            output = model(input_var)
+            loss = criterion(output, target_var)
+
+            # measure accuracy and record loss
+            prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+            losses.update(loss.data[0], input.size(0))
+            top1.update(prec1[0], input.size(0))
+            top5.update(prec5[0], input.size(0))
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                print('Test: [{0}/{1}]\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                      'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                       i, len(val_loader), batch_time=batch_time, loss=losses,
+                       top1=top1, top5=top5))
+
+        print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
+              .format(top1=top1, top5=top5))
+
+        return top1.avg
 
 
 def validate(args, val_loader, model, criterion):
@@ -281,8 +410,8 @@ def validate(args, val_loader, model, criterion):
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
                   'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                   i, len(val_loader), batch_time=batch_time, loss=losses,
-                   top1=top1, top5=top5))
+                i, len(val_loader), batch_time=batch_time, loss=losses,
+                top1=top1, top5=top5))
 
     print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
           .format(top1=top1, top5=top5))
