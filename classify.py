@@ -174,7 +174,7 @@ def run_training(args):
 
     step = 0
     for m in model.modules():
-        print(m.parameters().keys())
+        print(m.named_parameters()[0])
     weight_id = ray.put(model.parameters()['weight'])
     acc_id = test_actor.validate.remote(weight_id, step)
 
