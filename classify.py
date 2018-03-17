@@ -173,8 +173,8 @@ def run_training(args):
     test_actor = ResNetTestActor.remote()
 
     step = 0
-    weight_id = train_actors[0].get_weights.remote()
-    acc_id = test_actor.accuracy.remote(weight_id, step)
+    weight_id = ray.put(model.parameters()['weight'])
+    acc_id = test_actor.validate.remote(weight_id, step)
 
     if num_gpus == 0:
         num_gpus = 1
